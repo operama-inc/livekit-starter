@@ -20,6 +20,8 @@ from ..providers import (
     TTSProvider,
     StorageGateway
 )
+from .prompt_builder import PromptBuilder
+from .context_manager import ContextManager
 
 
 class ConversationOrchestrator:
@@ -174,32 +176,15 @@ class ConversationOrchestrator:
     ) -> str:
         """Generate a customer message based on persona and context"""
 
-        context = conversation.get_conversation_context()
+        # Use ContextManager to format context
+        context = ContextManager.format_context(conversation.turns)
 
-        # Build the customer prompt
-        prompt = f"""You are {persona.name} receiving a call from customer support.
-Your personality: {persona.personality}
-Your issue/situation: {persona.issue}
-Your goal: {persona.goal}
-Emotional state: {persona.emotional_state.value}
-
-Conversation so far:
-{context}
-
-Respond naturally based on your personality and situation.
-{persona.special_behavior}
-Keep your response under 2 sentences. Do not use any formatting or quotation marks. Just speak naturally."""
-
-        # Add guardrails if any
-        if persona.guardrails:
-            prompt += f"\nGuardrails: {', '.join(persona.guardrails)}"
-
-        # Use system prompt if provided
-        system_prompt = persona.system_prompt if persona.system_prompt else None
+        # Use PromptBuilder to build prompts
+        system_prompt, user_prompt = PromptBuilder.build_customer_prompt(persona, context)
 
         # Generate response
         response = await self.llm.generate_completion(
-            prompt=prompt,
+            prompt=user_prompt,
             system_prompt=system_prompt,
             temperature=conversation.config.temperature,
             max_tokens=conversation.config.max_tokens
@@ -216,45 +201,17 @@ Keep your response under 2 sentences. Do not use any formatting or quotation mar
     ) -> str:
         """Generate a support agent message based on persona and context"""
 
-        # Build the base system prompt
-        system_prompt = persona.system_prompt if persona.system_prompt else "You are a helpful customer support agent."
+        # Use ContextManager to format context
+        context = ContextManager.format_context(conversation.turns)
 
-        # Add company and agent info
-        if persona.company_name:
-            system_prompt = f"You work for {persona.company_name}. " + system_prompt
-        if persona.agent_name:
-            system_prompt = f"Your name is {persona.agent_name}. " + system_prompt
-
-        # Add policies
-        if persona.policies:
-            system_prompt += f"\n\nPolicies to follow:\n" + "\n".join(f"- {p}" for p in persona.policies)
-
-        # Add guardrails
-        if persona.guardrails:
-            system_prompt += f"\n\nGuardrails:\n" + "\n".join(f"- {g}" for g in persona.guardrails)
-
-        if is_opening:
-            prompt = """This is the start of a new call. Greet the customer warmly and introduce yourself.
-Follow your guidelines for the opening script. State your name, company, and the purpose of the call.
-Keep it natural and conversational. Do not use any formatting or quotation marks."""
-        elif is_closing:
-            context = conversation.get_conversation_context()
-            prompt = f"""Conversation so far:
-{context}
-
-The customer seems satisfied. Provide a warm closing to end the conversation.
-Keep it under 2 sentences. Do not use any formatting or quotation marks."""
-        else:
-            context = conversation.get_conversation_context()
-            prompt = f"""Conversation so far:
-{context}
-
-Respond professionally to help the customer. Keep it under 2 sentences.
-Follow your guidelines and policies. Do not use any formatting or quotation marks."""
+        # Use PromptBuilder to build prompts
+        system_prompt, user_prompt = PromptBuilder.build_support_prompt(
+            persona, context, is_opening, is_closing
+        )
 
         # Generate response
         response = await self.llm.generate_completion(
-            prompt=prompt,
+            prompt=user_prompt,
             system_prompt=system_prompt,
             temperature=conversation.config.temperature,
             max_tokens=conversation.config.max_tokens

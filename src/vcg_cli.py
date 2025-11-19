@@ -222,5 +222,11 @@ def show_config(ctx):
     print(f"  LiveKit: {'Enabled' if config.livekit.enabled else 'Disabled'}")
 
 
+# Note: LiveKit functionality has been moved to dedicated files:
+# - livekit_conversation_runner.py for orchestration
+# - batch_conversation_processor.py for batch processing
+# - customer_agent.py and support_agent.py for agent implementations
+
+
 if __name__ == '__main__':
     cli()
