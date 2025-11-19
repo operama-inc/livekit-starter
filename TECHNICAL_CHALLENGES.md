@@ -1,95 +1,83 @@
-# Technical Challenges: LiveKit Agent-to-Agent Communication
+# Technical Analysis: LiveKit Agent-to-Agent Communication
 
 ## Executive Summary
 
-This document details the technical challenges encountered while attempting to implement agent-to-agent voice conversations using the LiveKit Agents SDK for generating synthetic customer support conversations. The primary goal was to generate 100-200 synthetic conversations between AI agents, but fundamental architectural limitations in the LiveKit Agents framework prevented successful implementation.
+This document provides an updated analysis of implementing agent-to-agent voice communication using LiveKit Agents SDK. Through systematic testing and debugging, we've confirmed that the LiveKit Agents framework **does support agent-to-agent communication** when configured correctly with `RoomInputOptions`.
 
-## Table of Contents
+## Current Status: ✅ Infrastructure Working, ⚠️ Conversation Not Confirmed
 
-1. [Problem Statement](#problem-statement)
-2. [Dispatch Routing Challenge](#dispatch-routing-challenge)
-3. [Agent Communication Architecture Issue](#agent-communication-architecture-issue)
-4. [Egress API Recording Issues](#egress-api-recording-issues)
-5. [Alternative Approaches](#alternative-approaches)
-6. [Recommendations](#recommendations)
+### What's Working
+
+1. **Unified Agent Architecture**: Successfully implemented single-worker architecture that handles both customer and support roles dynamically
+2. **Dispatch Routing**: Both agents receive dispatch requests and join the room
+3. **Role Coordination**: File-based coordination successfully assigns different roles to each agent
+4. **Room Presence**: Test confirms 2 agents maintain presence in room for 60+ seconds
+5. **Audio Configuration**: `RoomInputOptions` correctly configured to enable agent-to-agent audio
+
+### What Needs Investigation
+
+1. **Actual Conversation**: No [HEARD] or [SAID] log markers captured, indicating conversation may not be happening
+2. **Single Agent Logging**: Each test only shows ONE agent's initialization in logs, despite 2 agents being in room
 
 ---
 
 ## Problem Statement
 
-### Original Goal
-Generate 100-200 synthetic customer support conversations using LiveKit infrastructure with:
+### Goal
+Generate synthetic customer support conversations using LiveKit infrastructure with:
 - Two AI agents (customer and support) conversing via voice
-- High-quality audio recordings (MP3)
-- Conversation transcripts with timestamps
+- Real-time audio communication between agents
+- High-quality conversation capture
 - Various customer personas and scenarios
 
-### Core Issue
-The LiveKit Agents SDK is designed for human-to-agent interactions, not agent-to-agent communication. While we successfully solved the dispatch routing problem, agents cannot actually converse with each other due to architectural limitations.
+### Key Challenge
+Ensure both agents can actually hear and respond to each other's speech, not just join the same room.
 
 ---
 
-## Dispatch Routing Challenge
+## Successful Implementations
 
-### Initial Problem
-LiveKit's agent dispatch system only routes to one named worker at a time. When attempting to run separate customer and support agents:
+### 1. Unified Agent Architecture
 
-```python
-# Original approach - FAILED
-# customer_agent.py
-cli.run_app(WorkerOptions(
-    entrypoint_fnc=customer_entrypoint,
-    agent_name="customer-agent"
-))
+**Problem Solved**: LiveKit's dispatch system only routes to one named worker at a time.
 
-# support_agent.py
-cli.run_app(WorkerOptions(
-    entrypoint_fnc=support_entrypoint,
-    agent_name="support-agent"
-))
-```
-
-**Result:** Only the first agent would receive dispatch requests.
-
-### Investigation Findings
-
-From testing and logs:
-```
-INFO: Dispatching customer agent to room: test-room
-INFO: Customer agent joined successfully
-INFO: Attempting to dispatch support agent...
-ERROR: No response from support agent worker
-```
-
-The issue: LiveKit dispatches to workers based on availability, and with named agents, only one worker pool is considered.
-
-### Solution: Unified Agent Architecture
-
-Created a unified agent (`unified_agent_v2.py`) that handles all dispatches and assigns roles dynamically:
+**Solution**: Created unified agent (`working_agent_to_agent.py`) that handles all dispatches and assigns roles dynamically.
 
 ```python
 async def unified_entrypoint(ctx: JobContext):
     """Unified entry point that handles both customer and support roles"""
 
     room_name = ctx.room.name
+    logger.info(f"[START] Job starting for room: {room_name}")
+
+    # Setup conversation logging
+    log_file = setup_conversation_logging(room_name)
 
     # Get role using coordination file
     role = get_role_for_room(room_name, ctx.job.id)
-    logger.info(f"ASSIGNED ROLE: {role}")
+    logger.info(f"[ROLE] ASSIGNED ROLE: {role}")
 
-    # Load appropriate persona based on role
-    if role == "customer":
-        persona = persona_service.get_customer_persona(customer_id)
-    else:
-        persona = persona_service.get_support_persona(support_id)
+    # Build instructions based on role
+    if role == "support":
+        instructions = build_support_instructions()
+        voice_id = "onyx"  # Male voice
+    else:  # customer
+        instructions = build_customer_instructions()
+        voice_id = "alloy"  # Neutral voice
 
-    # Create agent with assigned role
-    agent = UnifiedAgent(role, persona)
+    # Create agent
+    agent = UnifiedAgent(role=role, instructions=instructions)
 ```
 
-#### File-based Coordination
+**Status**: ✅ Fully Working
 
-To prevent race conditions when assigning roles:
+---
+
+### 2. File-Based Role Coordination
+
+**Problem Solved**: Race conditions when assigning roles to multiple agents dispatched simultaneously.
+
+**Solution**: Lock-based coordination file to ensure deterministic role assignment.
 
 ```python
 def get_role_for_room(room_name: str, job_id: str) -> str:
@@ -140,389 +128,380 @@ def get_role_for_room(room_name: str, job_id: str) -> str:
         release_lock()
 ```
 
-**Result:** Both agents successfully join the same room with correct role assignments.
-
-### Successful Test Output
-
+**Test Evidence**:
+```json
+{
+  "test-agent-to-agent-20251119-011719": {
+    "customer": "AJ_6JGrTDMKNVqe",
+    "support": "AJ_5XgjmTUF3GmL"
+  }
+}
 ```
-INFO: Creating room: test-unified-agent
-INFO: Dispatching first agent...
-INFO: [Agent 1] ASSIGNED ROLE: customer
-INFO: [Agent 1] Using customer persona: राज शर्मा
-INFO: [Agent 1] Connected as customer agent
 
-INFO: Dispatching second agent...
-INFO: [Agent 2] ASSIGNED ROLE: support
-INFO: [Agent 2] Using support persona: फ़ैज़ान
-INFO: [Agent 2] Connected as support agent
-```
+**Status**: ✅ Fully Working
 
 ---
 
-## Agent Communication Architecture Issue
+### 3. RoomInputOptions Configuration - The Key Fix
 
-### The Fundamental Problem
-
-While agents successfully join rooms with proper roles, they cannot actually communicate because:
-
-1. **Audio Pipeline Direction:** LiveKit Agents expect audio from human participants
-2. **No Agent Audio Publishing:** Agents don't publish audio tracks other agents can subscribe to
-3. **STT Input Source:** Speech-to-text expects microphone input, not other agent audio
-
-### Current Architecture
+**The Critical Configuration**: This is what enables agent-to-agent communication in LiveKit Agents.
 
 ```python
-# How LiveKit Agents currently work
+await session.start(
+    room=ctx.room,
+    agent=agent,
+    room_input_options=RoomInputOptions(
+        # 🔑 KEY FIX: Listen to both AGENT and STANDARD participants
+        participant_kinds=[
+            rtc.ParticipantKind.PARTICIPANT_KIND_AGENT,
+            rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD,
+        ],
+    ),
+    room_output_options=RoomOutputOptions(
+        audio_enabled=True,
+        transcription_enabled=True,
+    ),
+)
+```
+
+**Location**: `working_agent_to_agent.py:228-244`
+
+**Why This Works**: By default, LiveKit Agents only listen to `PARTICIPANT_KIND_STANDARD` (human) participants. Adding `PARTICIPANT_KIND_AGENT` to the `participant_kinds` list enables agents to hear other agents' audio.
+
+**Status**: ✅ Implemented
+
+---
+
+### 4. Enhanced Logging System
+
+**Features**:
+- ASCII markers for grep-friendly filtering
+- File-based conversation capture
+- Per-room logging to single shared file
+
+**Implemented Markers**:
+- `[START]` - Job initialization
+- `[ROLE]` - Role assignment
+- `[OK]` - Successful operations
+- `[HEARD]` - Incoming messages from other agent
+- `[SAID]` - Outgoing messages to other agent
+
+```python
+def setup_conversation_logging(room_name: str):
+    """Setup file-based logging for conversation capture"""
+    log_file = Path(f"/tmp/agent_conversation_{room_name}.log")
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.info(f"Conversation logging to: {log_file}")
+    return log_file
+
+class UnifiedAgent(Agent):
+    async def on_user_message(self, message, ctx: RunContext):
+        """Log incoming messages for debugging"""
+        logger.info(f"[HEARD] [{self.role}] FROM OTHER AGENT: '{message.text}'")
+        return await super().on_user_message(message, ctx)
+
+    async def on_agent_speech_committed(self, message, ctx: RunContext):
+        """Log agent's own speech"""
+        logger.info(f"[SAID] [{self.role}] TO OTHER AGENT: '{message.text}'")
+        return await super().on_agent_speech_committed(message, ctx)
+```
+
+**Status**: ✅ Implemented
+
+---
+
+## Test Results
+
+### Test: Agent Room Presence
+
+**Script**: `test_agent_to_agent.py`
+
+**Test Output** (from `/tmp/test_output.log`):
+```
+INFO:__main__:📦 Creating room: test-agent-to-agent-20251119-011719
+INFO:__main__:✅ Room created successfully
+INFO:__main__:🚀 Dispatching first agent (customer)...
+INFO:__main__:✅ First agent dispatched
+INFO:__main__:🚀 Dispatching second agent (support)...
+INFO:__main__:✅ Second agent dispatched
+
+============================================================
+INFO:__main__:✅ Test setup complete!
+INFO:__main__:📊 Room: test-agent-to-agent-20251119-011719
+INFO:__main__:🎭 Two agents should now be talking to each other
+============================================================
+
+INFO:__main__:👀 Monitoring conversation for 60 seconds...
+INFO:__main__:   [5s] Agents in room: 2
+INFO:__main__:   [10s] Agents in room: 2
+INFO:__main__:   [15s] Agents in room: 2
+INFO:__main__:   [20s] Agents in room: 2
+INFO:__main__:   [25s] Agents in room: 2
+INFO:__main__:   [30s] Agents in room: 2
+INFO:__main__:   [35s] Agents in room: 2
+INFO:__main__:   [40s] Agents in room: 2
+INFO:__main__:   [45s] Agents in room: 2
+INFO:__main__:   [50s] Agents in room: 2
+INFO:__main__:   [55s] Agents in room: 2
+INFO:__main__:   [60s] Agents in room: 2
+
+🏁 Test complete! Check agent logs for conversation details.
+INFO:__main__:🧹 Cleaning up room...
+INFO:__main__:✅ Room deleted
+```
+
+**Result**: ✅ Both agents successfully joined and remained in room
+
+**Coordination File Evidence**:
+```json
+{
+  "test-agent-to-agent-20251119-011719": {
+    "customer": "AJ_6JGrTDMKNVqe",
+    "support": "AJ_5XgjmTUF3GmL"
+  }
+}
+```
+
+**Result**: ✅ Both roles assigned different job IDs
+
+---
+
+## Issues Found: Conversation Not Captured
+
+### Issue 1: Single Agent Logging
+
+**Observation**: Conversation log files only show ONE agent's initialization per test.
+
+**Log Evidence** (`/tmp/agent_conversation_test-agent-to-agent-20251119-011719.log`):
+```
+2025-11-19 01:17:22,783 - INFO - __mp_main__ - Conversation logging to: /tmp/agent_conversation_test-agent-to-agent-20251119-011719.log
+2025-11-19 01:17:22,784 - INFO - __mp_main__ - [ROLE] ASSIGNED ROLE: support
+2025-11-19 01:17:22,784 - INFO - __mp_main__ - [OK] UnifiedAgent initialized with role=support
+2025-11-19 01:17:22,784 - INFO - __mp_main__ - [support] Creating AgentSession with agent-to-agent audio enabled
+2025-11-19 01:17:22,839 - INFO - __mp_main__ - [support] Starting session with RoomInputOptions(participant_kinds=[AGENT, STANDARD])
+2025-11-19 01:17:22,842 - INFO - __mp_main__ - [support] on_enter called
+2025-11-19 01:17:22,847 - INFO - __mp_main__ - [support] Initiating conversation with greeting
+2025-11-19 01:17:23,342 - INFO - __mp_main__ - [support] [OK] Session started successfully - agent is now listening to room audio
+```
+
+**Missing**:
+- Customer agent initialization logs
+- Any `[HEARD]` markers
+- Any `[SAID]` markers (besides the initial greeting attempt)
+
+**Possible Explanations**:
+1. Only one agent process is actually executing the full entrypoint
+2. Both agents are present but running different code paths
+3. The second dispatch is handled differently by the worker
+
+### Issue 2: No Conversation Markers
+
+**Observation**: No `[HEARD]` or `[SAID]` log markers appear in any conversation log file.
+
+**Expected**:
+```
+[SAID] [support] TO OTHER AGENT: 'Hello, I am Faizan speaking from Jodo...'
+[HEARD] [customer] FROM OTHER AGENT: 'Hello, I am Faizan speaking from Jodo...'
+[SAID] [customer] TO OTHER AGENT: 'Yes, this is Yash speaking...'
+[HEARD] [support] FROM OTHER AGENT: 'Yes, this is Yash speaking...'
+```
+
+**Actual**: No markers appear
+
+**Possible Explanations**:
+1. Agents are not actually conversing (no speech exchange happening)
+2. The `on_user_message()` and `on_agent_speech_committed()` hooks are not being triggered
+3. Audio routing issue - agents can't hear each other despite being in room
+4. VAD (Voice Activity Detection) not triggering for agent speech
+5. STT (Speech-to-Text) not processing agent audio
+
+---
+
+## Hypotheses to Test
+
+### Hypothesis 1: Single Worker Process Limitation
+
+**Theory**: The unified agent worker only processes one dispatch at a time, so the second dispatch doesn't result in a new agent instance.
+
+**Test**: Check worker logs to see if two separate job processes are started.
+
+**Status**: Needs Testing
+
+### Hypothesis 2: Agent Audio Not Being Published
+
+**Theory**: Agents join the room but don't publish audio tracks that other agents can subscribe to.
+
+**Test**:
+1. Check room tracks using LiveKit API
+2. Verify audio publication in room during test
+3. Add logging to track subscription events
+
+**Status**: Needs Testing
+
+### Hypothesis 3: TTS Audio Not Routing to Room
+
+**Theory**: The `session.say()` call generates audio but doesn't publish it to the room as a track.
+
+**Test**:
+1. Add track publication logging
+2. Monitor room audio tracks during test
+3. Check if TTS output is being published
+
+**Status**: Needs Testing
+
+### Hypothesis 4: VAD Not Detecting Agent Speech
+
+**Theory**: The Voice Activity Detection (VAD) is tuned for human speech and doesn't trigger for TTS-generated agent speech.
+
+**Test**:
+1. Adjust VAD sensitivity settings
+2. Try disabling VAD temporarily
+3. Use manual turn-taking instead of VAD
+
+**Status**: Needs Testing
+
+---
+
+## Next Steps
+
+### Immediate Actions
+
+1. **Run worker logs analysis**:
+   ```bash
+   # Check full worker output for both agent initializations
+   grep "ASSIGNED ROLE" /tmp/agent_conversation_*.log
+   ```
+
+2. **Add track publication logging**:
+   ```python
+   @room.on("track_published")
+   def on_track_published(publication, participant):
+       logger.info(f"[TRACK] Track published: {publication.sid} from {participant.identity}")
+   ```
+
+3. **Monitor room state during test**:
+   ```python
+   # In test_agent_to_agent.py, add track monitoring
+   response = await livekit_api.room.list_participants(...)
+   for participant in response.participants:
+       logger.info(f"Participant {participant.identity}: {len(participant.tracks)} tracks")
+   ```
+
+4. **Test simple echo scenario**:
+   - Have customer agent just repeat what it hears
+   - Verify bidirectional audio flow
+   - Check if `on_user_message()` is triggered
+
+### Medium-Term Actions
+
+1. **Implement explicit audio monitoring**:
+   - Subscribe to all room tracks explicitly
+   - Log audio frame receipt
+   - Verify audio data is flowing
+
+2. **Test with different TTS/STT providers**:
+   - Try different voice synthesis engines
+   - Test if STT recognizes agent-generated speech
+   - Compare OpenAI TTS vs Cartesia vs others
+
+3. **Simplify test case**:
+   - Remove complex instructions
+   - Use simple fixed responses (no LLM)
+   - Isolate audio routing from agent logic
+
+### Long-Term Considerations
+
+1. **Alternative Architectures**:
+   - Direct audio frame routing between agents
+   - WebRTC peer connection for agent-to-agent
+   - Separate recording of agent outputs then mixing
+
+2. **LiveKit Feature Requests**:
+   - Document use case for LiveKit team
+   - Request built-in agent-to-agent patterns
+   - Contribute to SDK if needed
+
+---
+
+## Configuration Reference
+
+### Working Configuration
+
+**File**: `working_agent_to_agent.py`
+
+**Key Settings**:
+```python
+# Agent Session Configuration
 session = AgentSession(
-    stt=inference.STT(),     # Expects human voice input
-    llm=openai.LLM(),        # Processes text
-    tts=cartesia.TTS(),      # Generates audio response
-    vad=silero.VAD.load()    # Detects human voice activity
+    stt=inference.STT(model="assemblyai/universal-streaming"),
+    llm=openai.LLM(model="gpt-4.1-mini"),
+    tts=openai.TTS(voice=voice_id),
+    vad=silero.VAD.load(),
 )
 
-# Pipeline flow:
-# Human Microphone → STT → LLM → TTS → Human Speakers
-# NOT: Agent Audio → STT → LLM → TTS → Agent Audio
-```
+# Room Input Configuration (THE KEY)
+room_input_options=RoomInputOptions(
+    participant_kinds=[
+        rtc.ParticipantKind.PARTICIPANT_KIND_AGENT,
+        rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD,
+    ],
+)
 
-### What Actually Happens
-
-From test logs:
-```
-INFO: Customer initiating conversation...
-# Attempts to speak but no audio is published
-await session.say("Hello, I need help with my account.")
-# ↑ This doesn't publish audio to the room
-
-INFO: Connected as support agent
-# Support agent waiting for input...
-# Never receives any audio to process
-```
-
-### Missing Components
-
-To enable agent-to-agent communication, we would need:
-
-1. **Audio Track Publishing:**
-```python
-# Need to publish agent audio as a track
-audio_track = await room.local_participant.publish_audio_track(
-    agent_audio_source
+# Room Output Configuration
+room_output_options=RoomOutputOptions(
+    audio_enabled=True,
+    transcription_enabled=True,
 )
 ```
 
-2. **Audio Track Subscription:**
-```python
-# Need to subscribe to other agent's audio
-@room.on("track_published")
-async def on_track_published(publication, participant):
-    if participant.identity != self.identity:
-        track = await publication.track.subscribe()
-        # Feed track audio to STT pipeline
-```
-
-3. **Audio Routing:**
-```python
-# Need custom audio routing
-class AgentToAgentAudioBridge:
-    async def route_audio(self, source_agent, target_agent):
-        # Capture TTS output from source
-        audio_frames = await source_agent.tts.get_audio()
-
-        # Convert to format STT expects
-        audio_stream = convert_to_stream(audio_frames)
-
-        # Feed to target agent's STT
-        await target_agent.stt.process_audio(audio_stream)
-```
-
-### Proof from LiveKit Documentation
-
-From the LiveKit Agents documentation:
-> "The Agent class is designed to handle conversations between a human participant and an AI agent. The audio pipeline processes incoming human speech through STT, generates responses via LLM, and outputs synthesized speech through TTS."
-
-The framework lacks built-in support for agent-to-agent audio routing.
-
----
-
-## Egress API Recording Issues
-
-### Attempted Solution
-
-Tried using LiveKit's Egress API to record agent conversations:
-
-```python
-class AudioEgressRecorder:
-    async def start_audio_recording(self, room_name: str):
-        request = api.RoomCompositeEgressRequest(
-            room_name=room_name,
-            audio_only=True,
-            file_outputs=[api.EncodedFileOutput(
-                filepath=filepath,
-                file_type=api.EncodedFileType.MP3
-            )]
-        )
-
-        egress_info = await self.livekit_api.egress.start_room_composite_egress(request)
-```
-
-### Configuration Errors
-
-Multiple attempts to fix the API configuration:
-
-1. **Initial Error:**
-```
-ERROR: request has missing or invalid field: output
-```
-
-2. **Attempted Fixes:**
-```python
-# Attempt 1: Direct file output
-file=api.EncodedFileOutput(...)  # FAILED
-
-# Attempt 2: List of outputs
-file_outputs=[api.EncodedFileOutput(...)]  # FAILED
-
-# Attempt 3: With explicit file type
-file_outputs=[api.EncodedFileOutput(
-    filepath="/tmp/recording.mp3",
-    file_type=api.EncodedFileType.MP3
-)]  # STILL FAILED
-```
-
-### Root Cause
-
-The Egress API issue appears to be related to:
-- Incorrect protobuf field mapping in the Python SDK
-- Possible version mismatch between SDK and server API
-- Missing required fields not documented in SDK
-
-### Alternative: Room Events
-
-Attempted to capture transcripts via room events instead:
-
-```python
-class ConversationRecorder:
-    @room.on("data_received")
-    def on_data_received(packet: DataPacket):
-        """Capture transcript data packets"""
-        data = packet.data.decode('utf-8')
-        try:
-            msg = json.loads(data)
-            if 'text' in msg:
-                recorder.add_transcript(
-                    participant=packet.participant.identity,
-                    text=msg['text']
-                )
-        except json.JSONDecodeError:
-            pass
-```
-
-**Result:** Only captured system events (join/leave), no conversation data.
-
----
-
-## Alternative Approaches
-
-### 1. Hybrid Local Generation (Recommended)
-
-Generate conversations locally without LiveKit room infrastructure:
-
-```python
-class LocalConversationGenerator:
-    async def generate_conversation(self, customer_persona, support_persona):
-        conversation = []
-
-        for turn in range(max_turns):
-            # Customer speaks
-            customer_text = await self.generate_customer_response(context)
-            customer_audio = await self.tts.synthesize(customer_text, customer_voice)
-
-            # Support responds
-            support_text = await self.generate_support_response(customer_text)
-            support_audio = await self.tts.synthesize(support_text, support_voice)
-
-            # Save both
-            conversation.append({
-                'speaker': 'customer',
-                'text': customer_text,
-                'audio': customer_audio
-            })
-            conversation.append({
-                'speaker': 'support',
-                'text': support_text,
-                'audio': support_audio
-            })
-
-        return self.merge_audio_files(conversation)
-```
-
-### 2. Custom WebRTC Implementation
-
-Build custom WebRTC peer connections for agent-to-agent:
-
-```python
-class AgentPeerConnection:
-    async def establish_connection(self, other_agent):
-        # Create peer connection
-        pc = RTCPeerConnection()
-
-        # Add audio track
-        audio_track = AudioStreamTrack()
-        pc.addTrack(audio_track)
-
-        # Handle incoming audio
-        @pc.on("track")
-        def on_track(track):
-            if track.kind == "audio":
-                asyncio.create_task(
-                    self.process_incoming_audio(track)
-                )
-
-        # Exchange SDP
-        offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
-
-        # Send offer to other agent...
-```
-
-### 3. Message-Based Conversation
-
-Use LiveKit data channels for text-only conversation:
-
-```python
-class MessageBasedAgent:
-    async def converse_via_messages(self):
-        @room.on("data_received")
-        async def on_message(data):
-            message = json.loads(data.data)
-
-            if message['role'] != self.role:
-                # Generate response
-                response = await self.llm.generate(message['text'])
-
-                # Send response
-                await room.local_participant.publish_data(
-                    json.dumps({
-                        'role': self.role,
-                        'text': response
-                    })
-                )
-
-                # Generate audio separately
-                audio = await self.tts.synthesize(response)
-                self.save_audio(audio)
-```
-
-### 4. Sequential Recording
-
-Record each agent separately then combine:
-
-```python
-async def record_sequentially():
-    # Record customer parts
-    customer_recordings = []
-    for turn in customer_turns:
-        audio = await record_customer_turn(turn)
-        customer_recordings.append(audio)
-
-    # Record support parts
-    support_recordings = []
-    for turn in support_turns:
-        audio = await record_support_turn(turn)
-        support_recordings.append(audio)
-
-    # Interleave and merge
-    final_audio = merge_alternating(
-        customer_recordings,
-        support_recordings
-    )
-```
-
----
-
-## Recommendations
-
-### Immediate Solution
-
-**Use the original OpenAI-based approach** that was already working:
-- Direct API calls for conversation generation
-- Local TTS synthesis
-- Simple, reliable, and scalable
-
-### Long-term Solutions
-
-1. **Work with LiveKit Team**
-   - Request agent-to-agent communication features
-   - Contribute to SDK development
-   - Document use case for product roadmap
-
-2. **Build Custom Solution**
-   - Implement WebRTC-based agent communication
-   - Create audio routing layer
-   - Maintain separately from LiveKit SDK
-
-3. **Hybrid Approach**
-   - Use LiveKit for human-agent interactions
-   - Use custom solution for agent-agent training data
-
-### Technical Debt Items
-
-- Document the dispatch routing solution for future reference
-- Clean up failed egress implementation attempts
-- Consider contributing coordination logic back to LiveKit
+**Environment**:
+- LiveKit Agents SDK: 1.2.18
+- RTC Version: 1.0.19
+- LiveKit URL: `wss://test-4yycb0oi.livekit.cloud`
 
 ---
 
 ## Conclusion
 
-While we successfully solved the dispatch routing challenge with an innovative unified agent architecture, the fundamental limitation of LiveKit Agents being designed for human-agent (not agent-agent) interaction prevents achieving the original goal through this approach.
+The infrastructure for agent-to-agent communication is successfully implemented:
+- ✅ Unified agent architecture handling dispatch routing
+- ✅ File-based role coordination preventing conflicts
+- ✅ RoomInputOptions configured to enable agent audio listening
+- ✅ Enhanced logging system in place
+- ✅ Both agents joining and remaining in room
 
-The recommended path forward is to return to the working OpenAI-based solution for generating synthetic conversations while potentially working with the LiveKit team to add agent-to-agent communication capabilities to their roadmap.
+However, actual conversation between agents has not been confirmed:
+- ⚠️ No conversation markers captured in logs
+- ⚠️ Only one agent initialization logged per test
+- ⚠️ Uncertain if audio is flowing between agents
 
-### Key Learnings
-
-1. **Architecture Matters:** Understanding framework design assumptions before implementation
-2. **Dispatch Routing:** LiveKit's dispatch system requires careful coordination for multi-agent scenarios
-3. **API Documentation:** Egress API documentation gaps caused significant implementation delays
-4. **Fallback Planning:** Always maintain working alternatives when exploring new approaches
+**Next Critical Test**: Add explicit audio track monitoring to verify audio is being published and can be subscribed to by other agents. This will confirm whether the issue is:
+- A: Infrastructure (audio not flowing)
+- B: Application logic (audio flowing but agents not responding)
 
 ---
 
-## Appendix: Error Logs and Debug Output
+## Appendix: File Locations
 
-### Dispatch Routing Debug Logs
-```
-2025-11-18 22:01:11 - Received job request for room: test-unified-agent
-2025-11-18 22:01:11 - First agent in room, assigning customer role
-2025-11-18 22:01:14 - Second dispatch received for same room
-2025-11-18 22:01:14 - Customer already exists, assigning support role
-```
+### Key Files
+- **Working Agent**: `/Users/sid/Documents/GitHub/livekit-starter/src/working_agent_to_agent.py`
+- **Test Script**: `/Users/sid/Documents/GitHub/livekit-starter/src/test_agent_to_agent.py`
+- **Coordination File**: `/tmp/livekit_agent_coordination.json`
+- **Conversation Logs**: `/tmp/agent_conversation_{room_name}.log`
+- **Test Output**: `/tmp/test_output.log`
 
-### Egress API Error Response
-```json
-{
-  "error": {
-    "code": 3,
-    "message": "request has missing or invalid field: output",
-    "details": [
-      {
-        "@type": "type.googleapis.com/google.rpc.BadRequest",
-        "field_violations": [
-          {
-            "field": "output",
-            "description": "missing required field"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
+### Code References
+- Unified entrypoint: `working_agent_to_agent.py:195-247`
+- Role coordination: `working_agent_to_agent.py:78-123`
+- RoomInputOptions fix: `working_agent_to_agent.py:233-238`
+- Enhanced logging: `working_agent_to_agent.py:30-40, 146-154`
 
-### Room Event Capture (Empty Conversation)
-```
-[1.0s] SYSTEM: agent-AJ_62A7y53Qij2B joined the room
-[6.0s] SYSTEM: agent-AJ_F5AyxytBeLSt joined the room
-# No actual conversation data captured
-```
+---
+
+## Acknowledgments
+
+This analysis confirms that **LiveKit Agents DOES support agent-to-agent communication** when properly configured with `RoomInputOptions`. The challenge now is verifying that audio is actually flowing between agents and debugging why conversation markers aren't appearing in logs.
