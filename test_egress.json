@@ -1,0 +1,8 @@
+{
+  "room_name": "test-room",
+  "audio_only": true,
+  "file": {
+    "filepath": "/tmp/test.mp3",
+    "file_type": "MP3"
+  }
+}
