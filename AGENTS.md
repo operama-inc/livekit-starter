@@ -6,9 +6,24 @@ The following is a guide for working with this project.
 
 ## Project structure
 
-This Python project uses the `uv` package manager. You should always use `uv` to install dependencies, run the agent, and run testss
+This Python project uses the `uv` package manager. You should always use `uv` to install dependencies, run the agent, and run tests.
 
-All app-level code is in the `src/` directory. In general, simple agents can be constructed with a single `agent.py` file. Additional files can be added, but you must retain `agent.py` as the entrypoint (see the associated Dockerfile for how this is deployed).
+All app-level code is in the `src/` directory. The project supports both single-agent and multi-agent architectures:
+
+### Single Agent
+- Simple agents can be constructed with a single `agent.py` file as the entrypoint (see the associated Dockerfile for deployment)
+
+### Multi-Agent Architecture
+This project includes an agent-to-agent communication implementation with:
+- `support_agent.py` - Support agent with distinct worker identity
+- `customer_agent.py` - Customer agent with distinct worker identity
+- `livekit_conversation_runner.py` - Orchestrator for room creation and agent dispatch
+- `run_agents.sh` - Shell script for running the complete multi-agent system
+
+For detailed implementation guidance, see `AGENT_TO_AGENT_GUIDE.md`.
+
+### Voice Conversation Generator
+The project includes a comprehensive voice conversation generator framework in `src/voice_conversation_generator/` for creating synthetic customer support conversations with multiple TTS providers (OpenAI, Cartesia, ElevenLabs).
 
 Be sure to maintain code formatting. You can use the ruff formatter/linter as needed: `uv run ruff format` and `uv run ruff check`.
 
@@ -40,6 +55,16 @@ gemini mcp add --transport http livekit-docs https://docs.livekit.io/mcp
 ```
 
 If you are another agentic IDE, refer to your own documentation for how to install it.
+
+## Agent-to-Agent Communication
+
+This project includes an implementation of agent-to-agent voice communication, allowing multiple AI agents to converse with each other in a LiveKit room. The architecture uses:
+
+- **Separate Worker Processes**: Each agent runs as an independent worker with a unique `agent_name`
+- **Agent Dispatch API**: Orchestrator explicitly dispatches both agents to the same room
+- **Room Management**: Centralized orchestration for room creation and monitoring
+
+**Current Status**: Infrastructure is complete and both agents successfully join rooms. The main pending work is enabling agent-to-agent audio flow using RoomInputOptions. See `AGENT_TO_AGENT_GUIDE.md` for detailed implementation status and troubleshooting.
 
 ## Handoffs and tasks ("workflows")
 

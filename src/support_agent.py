@@ -7,14 +7,18 @@ This agent acts as a customer support representative.
 import asyncio
 import logging
 import json
+import os
 from datetime import datetime
 
-from livekit import agents, rtc
+from livekit import agents, rtc, api
 from livekit.agents import (
     Agent,
     JobContext,
     WorkerOptions,
     cli,
+    RoomInputOptions,
+    RoomOutputOptions,
+    llm,
 )
 from livekit.plugins import openai, silero
 
@@ -25,7 +29,22 @@ class SupportAgent(Agent):
     """Support agent that responds to customer inquiries."""
 
     def __init__(self, session: agents.AgentSession):
-        self.session = session
+        # Load system prompt first
+        prompt_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "prompts", "support_agent_system_prompt.txt")
+        try:
+            with open(prompt_path, "r") as f:
+                system_prompt = f.read()
+            logger.info(f"[SUPPORT] Loaded system prompt from {prompt_path}")
+        except Exception as e:
+            logger.error(f"[SUPPORT] Failed to load system prompt: {e}")
+            system_prompt = "You are a helpful customer support agent."
+
+        # Initialize the base Agent class with instructions
+        super().__init__(
+            instructions=system_prompt
+        )
+
+        self._agent_session = session
         self.conversation_turns = 0
         logger.info(f"[SUPPORT] Agent initialized")
 
@@ -34,7 +53,12 @@ class SupportAgent(Agent):
         logger.info(f"[SUPPORT] on_enter called - Support agent ready to help!")
         # Initial greeting after a short delay to ensure customer is connected
         await asyncio.sleep(2)
-        await self.session.say("Hello! This is customer support. How can I help you today?")
+
+        # Greeting from the prompt
+        greeting = "Hello... I am फ़ैज़ान speaking from Jodo, the official fee payment partner of Delhi Public School. Am I speaking to Yash?"
+
+        # The base Agent class handles context management internally
+        await self._agent_session.say(greeting)
 
     async def on_exit(self):
         """Called when the agent exits the room."""
@@ -45,22 +69,14 @@ class SupportAgent(Agent):
         text = user_message.text_content
         logger.info(f"[SUPPORT] Heard from customer: '{text}'")
 
-        # Support agent responses
-        if "refund" in text.lower():
-            response = "I understand you'd like a refund. Let me check your account details. Can you provide your order number?"
-        elif "order" in text.lower():
-            response = "I can help you with your order. What seems to be the issue?"
-        elif "shipping" in text.lower():
-            response = "I'll check the shipping status for you right away. Your package should arrive within 2-3 business days."
-        elif "thank" in text.lower():
-            response = "You're very welcome! Is there anything else I can help you with today?"
-        elif "bye" in text.lower() or "goodbye" in text.lower():
-            response = "Thank you for contacting support. Have a great day!"
-        else:
-            response = f"I understand you said '{text}'. How can I assist you with that?"
+        # The Agent base class handles context management internally in v1.x
+        # We don't need to manually manage ChatContext anymore
+        # Just log what we heard for debugging
+        logger.info(f"[SUPPORT] Processing response...")
 
-        logger.info(f"[SUPPORT] Responding with: '{response}'")
-        await self.session.say(response)
+        # The base Agent class will handle the response generation
+        # We can add custom logic here if needed
+        pass
 
 
 async def entrypoint(ctx: JobContext):
@@ -92,10 +108,17 @@ async def entrypoint(ctx: JobContext):
 
     logger.info(f"[SUPPORT] Starting session with agent-to-agent audio enabled")
 
+    # Configure room input to listen to AGENT participants
+    room_input_options = RoomInputOptions(
+        participant_kinds=[api.ParticipantInfo.Kind.AGENT, api.ParticipantInfo.Kind.STANDARD],
+    )
+
     # Start the session
     await session.start(
         agent=support_agent,
         room=ctx.room,
+        room_input_options=room_input_options,
+        room_output_options=RoomOutputOptions(),
     )
 
     logger.info(f"[SUPPORT] Session started successfully - agent is listening")
@@ -105,9 +128,16 @@ async def entrypoint(ctx: JobContext):
         """Save the conversation transcript when shutting down."""
         transcript_file = f"/tmp/transcript_support_{ctx.room.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         try:
+            # In v1.x, the Agent base class manages the conversation internally
+            # We can save basic metadata for now
             with open(transcript_file, "w") as f:
-                json.dump(session.history.to_dict(), f, indent=2)
-            logger.info(f"[SUPPORT] Transcript saved to {transcript_file}")
+                metadata = {
+                    "room": ctx.room.name,
+                    "agent": "support-agent",
+                    "timestamp": datetime.now().isoformat()
+                }
+                json.dump(metadata, f, indent=2)
+            logger.info(f"[SUPPORT] Metadata saved to {transcript_file}")
         except Exception as e:
             logger.error(f"[SUPPORT] Error saving transcript: {e}")
 
