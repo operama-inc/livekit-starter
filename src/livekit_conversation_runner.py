@@ -18,7 +18,8 @@ load_dotenv(".env.local")
 
 # Import LiveKit SDK
 from livekit import api, rtc
-from livekit.api import room_service, agent_dispatch_service
+from livekit.api import room_service, agent_dispatch_service, egress_service
+from livekit.protocol.egress import RoomCompositeEgressRequest, EncodedFileOutput, EncodedFileType
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -74,8 +75,16 @@ class LiveKitConversationRunner:
 
                 # Dispatch the agent
                 dispatch = await dispatch_api.create_dispatch(dispatch_request)
-                logger.info(f"Successfully dispatched {agent_name} to room {room_name}")
-                return True  # Just return success status
+                logger.info(f"Created dispatch for {agent_name}: {dispatch}")
+
+                # List dispatch verification temporarily disabled due to API issues
+                # await asyncio.sleep(0.5)  # Small delay to let dispatch register
+                # dispatches = await dispatch_api.list_dispatch(api.ListAgentDispatchRequest(room=room_name))
+                # logger.info(f"Active dispatches in room {room_name}:")
+                # for d in dispatches.dispatches if hasattr(dispatches, 'dispatches') else []:
+                #     logger.info(f"  - Dispatch {d.id}: agent_name={d.agent_name} state={getattr(d.state, 'state', 'N/A')}")
+
+                return True  # Return success status
             except Exception as e:
                 logger.error(f"Error dispatching {agent_name}: {e}")
                 raise
@@ -110,10 +119,50 @@ class LiveKitConversationRunner:
                         state_str = p.state.name if hasattr(p.state, 'name') else str(p.state)
                         logger.info(f"  - {p.identity} (kind: {kind_str}, state: {state_str})")
 
+                    # Check if we have the expected 2 agents
+                    if agent_count == 2:
+                        logger.info(f"✓ Both agents are present in room {room_name}")
+                    elif agent_count == 0 and i > 10:
+                        logger.info(f"✓ Room empty - conversation has ended")
+                        return  # Exit monitoring
+
                 except Exception as e:
                     logger.error(f"Error monitoring room: {e}")
 
                 await asyncio.sleep(5)
+
+    async def start_audio_egress(self, room_name: str, output_path: str = None) -> str:
+        """Start audio-only egress recording for the room."""
+        if not output_path:
+            output_path = f"/tmp/livekit_conv_{room_name}.mp4"
+
+        async with aiohttp.ClientSession() as session:
+            egress_api = egress_service.EgressService(session, self.url, self.api_key, self.api_secret)
+
+            try:
+                # Configure audio-only file output
+                file_output = EncodedFileOutput(
+                    file_type=EncodedFileType.MP4,
+                    filepath=output_path,
+                )
+
+                # Create egress request for audio-only room composite
+                req = RoomCompositeEgressRequest(
+                    room_name=room_name,
+                    audio_only=True,
+                    file_outputs=[file_output],  # Use file_outputs as a list
+                )
+
+                # Start the egress
+                info = await egress_api.start_room_composite_egress(req)
+                logger.info(f"Started audio egress {info.egress_id} for room {room_name}")
+                logger.info(f"Audio will be saved to: {output_path}")
+                return info.egress_id
+            except Exception as e:
+                logger.error(f"Error starting egress: {e}")
+                # For now, return None instead of raising to allow conversation to continue
+                logger.warning(f"Continuing without audio recording due to egress error")
+                return None
 
     async def delete_room(self, room_name: str):
         """Delete a LiveKit room."""
@@ -135,12 +184,24 @@ class LiveKitConversationRunner:
         logger.info(f"Starting agent-to-agent conversation in room: {room_name}")
         logger.info("=" * 60)
 
+        egress_id = None
+        audio_path = f"/tmp/livekit_conv_{room_name}.mp4"
+
         try:
             # Step 1: Create the room
             await self.create_room(room_name)
             await asyncio.sleep(1)
 
-            # Step 2: Dispatch both agents explicitly
+            # Step 2: Start audio egress recording
+            logger.info("Attempting to start audio recording...")
+            egress_id = await self.start_audio_egress(room_name, audio_path)
+            if egress_id:
+                logger.info(f"Audio recording started with egress ID: {egress_id}")
+            else:
+                logger.warning("Audio recording not available, continuing without it")
+            await asyncio.sleep(1)
+
+            # Step 3: Dispatch both agents explicitly
             logger.info("Dispatching agents...")
 
             # Dispatch support agent
@@ -154,14 +215,22 @@ class LiveKitConversationRunner:
 
             logger.info(f"Both agents dispatched successfully to room: {room_name}")
 
-            # Step 3: Monitor the conversation
+            # Step 4: Monitor the conversation
             await asyncio.sleep(3)  # Give agents time to connect
             await self.monitor_room(room_name, monitor_duration)
 
             logger.info("=" * 60)
             logger.info("Conversation monitoring complete")
-            logger.info(f"Check /tmp/transcript_*_{room_name}_*.json for transcripts")
+            logger.info(f"Check for outputs:")
+            logger.info(f"  - Audio recording: {audio_path}")
+            logger.info(f"  - Transcripts: /tmp/transcript_*_{room_name}_*.json")
             logger.info("=" * 60)
+
+            return {
+                "room_name": room_name,
+                "egress_id": egress_id,
+                "audio_path": audio_path,
+            }
 
         except Exception as e:
             logger.error(f"Error during conversation: {e}")
@@ -195,7 +264,16 @@ async def main():
     await asyncio.sleep(3)
 
     # Run the conversation
-    await runner.run_conversation(room_name, monitor_duration)
+    result = await runner.run_conversation(room_name, monitor_duration)
+
+    if result:
+        logger.info("=" * 60)
+        logger.info("Conversation completed successfully!")
+        logger.info(f"Results saved to:")
+        logger.info(f"  Room: {result['room_name']}")
+        logger.info(f"  Audio: {result['audio_path']}")
+        logger.info(f"  Egress ID: {result['egress_id']}")
+        logger.info("=" * 60)
 
 
 if __name__ == "__main__":

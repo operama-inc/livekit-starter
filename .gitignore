@@ -13,6 +13,7 @@ KMS
 
 # Generated test outputs
 conversations/
+livekit_conversations/
 results/
 report.html
 *.mp3
